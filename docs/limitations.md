@@ -10,7 +10,6 @@ This document lists features that the voidful installer does **not** currently s
 |---------|--------|-------|
 | **LVM** | ❌ Not supported | No Logical Volume Manager support. Use LUKS + LVM after installation if needed. |
 | **RAID** | ❌ Not supported | No software RAID (mdadm) or hardware RAID configuration. |
-| **MBR** | ❌ Not supported | GPT is the only supported partition table format. See `docs/partitioning.md` for details. |
 | **Non-contiguous partitions** | ❌ Not supported | All partitions must be sequential on the target disk. |
 
 ### Installation Source
@@ -18,7 +17,7 @@ This document lists features that the voidful installer does **not** currently s
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Network installation** | ❌ Not supported | The installer is offline-only. Uses the live ISO rootfs as the base system. |
-| **Custom package repository** | ❌ Not supported | The installer uses only the Live ISO's repodata. No network access or custom repository sync is allowed. See `AGENTS.md` for Zero Internet Dependency constraint. |
+| **Custom package repository** | ❌ Not supported | No packages are ever downloaded or installed — the installer only *removes* packages from the cloned live rootfs. No network access or custom repository sync is allowed. See `AGENTS.md` for Zero Internet Dependency constraint. |
 | **Partial clone** | ❌ Not supported | The entire live system rootfs is cloned. Cannot selectively clone packages. |
 
 ### Encryption
@@ -37,7 +36,7 @@ This document lists features that the voidful installer does **not** currently s
 |---------|--------|-------|
 | **GRUB** | ✅ Supported | Both UEFI and BIOS modes. `grub-install --bootloader-id=void_grub --recheck`. |
 | **systemd-boot** | ❌ Not supported | Only GRUB is supported as a bootloader. |
-| **No bootloader** | ✅ Supported | Set `BOOTLOADER="none"` to skip bootloader installation. Exit code 6 (bootloader error) is not applicable in this case. |
+| **No bootloader** | ✅ Supported | Set `BOOTLOADER="none"` to skip bootloader installation (the grub packages are also removed during cleanup). |
 
 ### System Configuration
 
@@ -47,6 +46,7 @@ This document lists features that the voidful installer does **not** currently s
 | **Multiple users** | ❌ Not supported | Only one regular user can be created (`CREATE_USER="yes"`). |
 | **Custom runit services** | ✅ Supported | Via `ENABLED_SERVICES` comma-separated string (parsed into an array during service enabling). |
 | **Locale generation** | ✅ Supported | Single locale via `LOCALE` variable. |
+| **Install-time package list** | ❌ Not supported | No `INSTALL_PACKAGES` support (removed — it required network `xbps-install -Sy`). The offline clone installs only the live ISO's rootfs; add packages post-installation. |
 
 ## Hardware Limitations
 
@@ -60,5 +60,42 @@ This document lists features that the voidful installer does **not** currently s
 ## Workarounds
 
 For unsupported features, consider post-installation configuration using standard Void Linux tools.
+
+### GRUB device probing inside the live session (testing note)
+
+When the installer runs **inside the minimal Void live ISO** (e.g. via `qemu_boot_test.sh` or a bare live boot),
+`grub-install` / `grub-probe` may emit errors such as:
+
+```
+grub-probe: error: failed to get canonical path of `devtmpfs'.
+```
+
+This is **not** a bootloader failure and does not occur on real hardware. The minimal live initramfs does not fully
+initialize the kernel block device (`/dev/vda`) before the post-clone GRUB step runs, so `grub-probe` cannot resolve the
+drive geometry in `devtmpfs`. On real hardware — which has a complete `udev`/`systemd` stack — `/dev/vda` is fully
+initialized by the time GRUB installs (installed to its MBR; see `_install_grub()`), so this warning never appears.
+
+If you observe these messages during automated testing, they are an environment artifact of the minimal live session,
+not a regression in bootloader installation.
+
+### `btrfs subvolume list -s` is unreliable (btrfs-progs v6.11, testing note)
+
+On the installed system's btrfs-progs (v6.11), `btrfs subvolume list -s /` returns **empty even when a default
+subvolume is set** — it is not a valid verification of `btrfs subvolume set-default`. Verified on a QEMU install:
+after `set-default 5` (top level) and `set-default 256` (subvolume `@`), a bare `mount /dev/mapper/<dev>` (no
+`subvol=` option) correctly landed on the newly-defaulted subvolume in both cases, while `list -s` stayed empty.
+
+To verify the default subvolume, use a behavioral check instead:
+
+```bash
+# Bare mount (no subvol= option) — shows the DEFAULT subvolume's contents
+mkdir -p /tmp/btrfs_default_check
+mount /dev/mapper/luks-root /tmp/btrfs_default_check
+ls /tmp/btrfs_default_check   # rootfs contents (bin, etc, ...) = default is @; empty = top level
+umount /tmp/btrfs_default_check
+```
+
+The installer itself does not depend on `list -s` — it checks `set-default`'s exit code (see
+`docs/user_config.md`, step 18).
 
 

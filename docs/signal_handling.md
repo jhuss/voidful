@@ -6,6 +6,8 @@ The installer uses `trap` to ensure clean unmounting and resource cleanup on int
 
 The installer uses a **two-trap pattern**: one for `EXIT` (always runs, performs cleanup) and separate handlers for `INT`/`TERM`/`HUP` (cleanup + explicit exit code).
 
+> **Cleanup guard (`INSTALL_STARTED`):** The traps are installed at script startup, *before* argument parsing. To prevent early exits (`--help`, `--version`, `--dry-run`, `--test-mode`, config/preflight errors) from running teardown, `trap_cleanup` only performs cleanup once the installation pipeline has started creating state (partitions/mounts) — i.e. after `INSTALL_STARTED=true` is set in `main` just before `stage_partition`. Before that point, `trap_cleanup` returns without unmounting or logging an interruption, so `--help`/`--version`/`--dry-run`/`--test-mode` exit cleanly with no side effects.
+
 ## Why Two Traps?
 
 | Trap | Purpose | Exit Code |
@@ -43,21 +45,21 @@ With `set -u` (treat unset variables as errors), all variable references inside 
 
 ## Double Unmount Handling
 
-Both the signal handler (`_cleanup()`) and the Teardown step (step 6 in the pipeline) call `umount -R "${TARGET_DIR}"`. The `|| true` guards ensure that any double-unmount attempts fail silently.
+Both the signal path and the Teardown step (step 7 in the pipeline, `stage_teardown`) call `umount` on the same mount points. The `|| true` guards ensure that any double-unmount attempts fail silently.
 
-> **Note:** The `end_actions()` function does **NOT** call `umount -R`. It only executes the configured post-install action (shutdown, reboot, script, or func) after the Teardown step has already unmounted the filesystem. See `docs/end_actions.md` for details.
+> **Note:** The `stage_end_action()` function does **NOT** call `umount -R`. It only executes the configured post-install action (shutdown, reboot, script, func, or none) after the Teardown step has already unmounted the filesystem. See `docs/end_actions.md` for details.
 
 ## Exit Code Handling
 
-The installer uses standardized exit codes (see `docs/exit_codes.md`). Signal handlers always exit with code 8. The `EXIT` trap preserves the exit code from the failing command, including exit code 10 (mount/umount error).
+The installer uses standardized exit codes (see `docs/exit_codes.md`). Signal handlers always exit with code 8. The `EXIT` trap preserves the exit code from the failing command (module failures uniformly exit `1`; see `docs/exit_codes.md`).
 
 ## PIPE Signal Handling
 
 With `set -o pipefail`, a broken pipe in `tar | tar` (used during system cloning) will cause the pipeline to fail. The `PIPE` trap ensures cleanup runs before the script exits.
 
-> **Note:** The `PIPE` trap uses the same `handle_signal` function as `INT`/`TERM`/`HUP`. This is intentional — all signals should perform the same cleanup and exit with code 8.
+> **Note:** All four signals are trapped by the same inline trap command — `trap 'trap_cleanup; exit 8' INT TERM HUP PIPE` (no named handler function). This is intentional — all signals should perform the same cleanup and exit with code 8.
 >
-> **Interaction with `set -o pipefail`:** When a broken pipe occurs, `pipefail` causes the pipeline to return a non-zero exit code. The `PIPE` trap fires and calls `_cleanup()`, which performs unmounting with `|| true` guards for idempotency. The `exit 8` in `handle_signal` then causes the script to exit, which also triggers the `EXIT` trap. Since `_cleanup()` already ran, the `EXIT` trap's unmount calls are no-ops (protected by `|| true`). This ensures cleanup runs exactly once even when multiple signals fire in quick succession.
+> **Interaction with `set -o pipefail`:** When a broken pipe occurs, `pipefail` causes the pipeline to return a non-zero exit code. The `PIPE` trap fires and runs `trap_cleanup`, which performs unmounting with `|| true` guards for idempotency. The `exit 8` then causes the script to exit, which also triggers the `EXIT` trap. Since cleanup already ran, the `EXIT` trap's unmount calls are no-ops (protected by `|| true`). This ensures cleanup runs exactly once even when multiple signals fire in quick succession.
 
 ## TARGET_DIR Cleanup Policy
 

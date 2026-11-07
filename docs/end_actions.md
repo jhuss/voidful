@@ -2,10 +2,11 @@
 
 After installation completes, support configurable post-install behavior via the `END_ACTION` variable:
 
-- `shutdown` (default): run `shutdown -P now` (unmount + sync already done by Teardown step)
-- `reboot`: run `shutdown -r now` (unmount + sync already done by Teardown step)
+- `shutdown` (default): run `poweroff` (unmount + sync already done by Teardown step)
+- `reboot`: run `reboot` (unmount + sync already done by Teardown step)
 - `script`: execute a user-provided script (passed via environment variables like `TARGET_DIR`)
 - `func`: call a user-defined bash function
+- `none`: do nothing — the system is left running with no action (the installer simply exits `0`)
 
 ## Mode Comparison
 
@@ -15,14 +16,14 @@ After installation completes, support configurable post-install behavior via the
 | **Can modify installer state** | ❌ No | ✅ Yes |
 | **Can call installer functions** | ❌ No | ✅ Yes |
 | **Environment variables** | ✅ Inherited | ✅ Inherited |
-| **Error propagation** | Exit code captured but installer continues | Exit code terminates installer immediately |
+| **Error propagation** | A failing script terminates the installer under `set -e` (child's exit code propagates) | Exit code terminates installer immediately |
 | **Setup required** | Script file path + `chmod +x` | Function definition + `export -f` |
 | **Debugging** | Easier — separate file | Harder — same shell |
 | **Use case** | Simple post-install tasks | Complex logic needing installer state |
 
 ## Implementation Pattern
 
-The `end_actions()` function executes the configured post-install action based on `END_ACTION`. Unmounting and syncing are handled by the Teardown step (step 6 in the pipeline) before `end_actions()` is called.
+The `stage_end_action()` function executes the configured post-install action based on `END_ACTION`. Unmounting and syncing are handled by the Teardown step (step 7 in the pipeline) before `stage_end_action()` is called.
 
 ### `script` Mode
 
@@ -55,12 +56,12 @@ export -f my_post_install
 
 ### Safety Notes
 
-- `end_actions()` is called after the Teardown step completes (unmount + sync already done)
-- All modes only execute the configured action (shutdown, reboot, script, or func)
+- `stage_end_action()` is called after the Teardown step completes (unmount + sync already done)
+- All modes only execute the configured action (shutdown, reboot, script, func, or none)
 - `script` mode validates that `END_ACTION_SCRIPT` is set before proceeding
 - `func` mode validates that `END_ACTION_FUNC` is set before proceeding
-- Invalid `END_ACTION` values result in an error and exit code 1
+- Invalid `END_ACTION` values result in a `log_error` and exit code `9`
 
 ### Double Unmount Handling
 
-The signal handler (`_cleanup()`) calls `umount -R "${TARGET_DIR}"` on interruption. The Teardown step (step 6) also calls `umount -R` on normal completion. The `|| true` guard ensures that if `_cleanup()` has already unmounted, the Teardown step will fail silently. `end_actions()` does **NOT** call unmount — it only executes the configured action. See `docs/signal_handling.md` for more details.
+The signal handler (`trap_cleanup`) calls `umount -R "${TARGET_DIR}"` on interruption. The Teardown step (step 7) also calls `umount -R` on normal completion. The `|| true` guard ensures that if `trap_cleanup` has already unmounted, the Teardown step will fail silently. `stage_end_action()` does **NOT** call unmount — it only executes the configured action. See `docs/signal_handling.md` for more details.

@@ -60,64 +60,38 @@ For Btrfs systems, the root subvolume `@` **must be mounted first** before cloni
 Use `tar` to copy the live system rootfs to the target disk:
 
 ```bash
-# Clone the entire live system
-tar --create \
-    --one-file-system \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory=/ \
-    -f - | \
-tar --extract \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory="${TARGET_DIR}" \
-    --no-overwrite-dir \
-    --preserve-permissions
+# Clone the entire live system (pipefail suspended around the pipeline;
+# both statuses are checked via PIPESTATUS)
+tar --create --one-file-system --xattrs -f - \
+    --exclude=./var/log \
+    --exclude=./etc/machine-id \
+    / 2>create_err | \
+tar --extract --xattrs --xattrs-include='*' --preserve-permissions -f - \
+    -C "${TARGET_DIR}" 2>extract_err
 ```
 
 **Key flags:**
-- `--one-file-system`: Do not cross filesystem boundaries (excludes /proc, /sys, /dev, etc.)
+- `--one-file-system`: Do not cross filesystem boundaries (excludes /proc, /sys, /dev, the live ISO's squashfs, etc.)
 - `--xattrs`: Preserve extended attributes
 - `--xattrs-include='*'`: Preserve all extended attributes
-- `--no-overwrite-dir`: Preserve metadata of existing directories (safety for /boot/efi, etc.)
+- `--exclude=./var/log` / `--exclude=./etc/machine-id`: Keep per-boot volatile state out of the clone
 - `--preserve-permissions`: Preserve file permissions during extraction
+- There is **no** `--no-overwrite-dir` — destination directories are overwritten so the target rootfs matches the source
 
 **Progress Display:**
 
-For clone operations that take 5-15 minutes, show periodic status updates:
+For clone operations that take 5-15 minutes, `_progress_indicator 30` (in `lib/clone.sh`) prints a periodic status line every 30 seconds in the background:
 
 ```bash
-# Decision D1: Use periodic status messages (sleep 30), not file counting
-# File counting adds complexity for marginal accuracy gain
+# Start background progress indicator (30s interval)
+_progress_indicator 30 &
+PROGRESS_PID=$!
 
-# Start background progress updater
-(
-    while true; do
-        log_info "  [clone progress] Still cloning..."
-        sleep 30
-    done
-) &
-local clone_bg=$!
+# ... perform the clone (tar pipeline above) ...
 
-# Perform clone
-tar --create \
-    --one-file-system \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory=/ \
-    -f - | \
-tar --extract \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory="${TARGET_DIR}" \
-    --no-overwrite-dir \
-    --preserve-permissions
-
-# Clean up background counter
-kill ${clone_bg} 2>/dev/null || true
-wait ${clone_bg} 2>/dev/null || true
-
-log_info "System clone complete"
+# Clean up background progress indicator
+kill "${PROGRESS_PID}" 2>/dev/null || true
+wait "${PROGRESS_PID}" 2>/dev/null || true
 ```
 
 See `docs/progress.md` for the complete sub-step progress pattern.
@@ -131,61 +105,63 @@ See `docs/progress.md` for the complete sub-step progress pattern.
 
 ### 3.1: Remove Live Environment Files
 
-Remove files and directories from the live environment that are not needed on the target:
+`remove_live_files()` (in `lib/cleanup.sh`) removes every item below from the target, each guarded by an existence check (and, where the target may contain more than one file, with `|| true`) and logged with `log_info`. Note the initramfs mount point is removed with `rm -rf` (guarded by a `-d` check), not `rmdir`:
 
 ```bash
 # Remove live installer binary (not owned by any package on live ISO)
-rm -f "${TARGET_DIR}/usr/bin/void-installer" 2>/dev/null || true
+rm -f "${target_dir}/usr/bin/void-installer"
 
 # Remove live sudoers override (grants NOPASSWD to live user)
-rm -f "${TARGET_DIR}/etc/sudoers.d/99-void-live" 2>/dev/null || true
+rm -f "${target_dir}/etc/sudoers.d/99-void-live"
 
-# Remove live ISO mount points (created during installation)
-rmdir "${TARGET_DIR}/run/initramfs" 2>/dev/null || true
+# Remove live ISO mount point (created during installation)
+rm -rf "${target_dir}/run/initramfs"
+
+# Reset SDDM config to defaults
+rm -f "${target_dir}/etc/sddm.conf"
+
+# Remove live polkit rules
+rm -f "${target_dir}/etc/polkit-1/rules.d/void-live.rules"
+
+# Remove live user auto-login from getty (if configured;
+# uses ${LIVE_USERNAME}, default 'anon')
+sed -i "s,GETTY_ARGS=\"--noclear -a ${live_user}\",GETTY_ARGS=\"--noclear\",g" "${target_dir}/etc/sv/agetty-tty1/conf"
+
+# Remove SSH host keys and user .ssh directories
+rm -f "${target_dir}/etc/ssh/ssh_host_"*
+rm -rf "${target_dir}/root/.ssh" "${target_dir}/home/"*"/.ssh"
 ```
 
 **Files removed:**
 - `/usr/bin/void-installer` — The installer binary itself (not owned by any package on live ISO)
 - `/etc/sudoers.d/99-void-live` — Live user sudoers override (owned by `sudo` package, safe to remove)
 - `/run/initramfs` — Live ISO mount point
+- `/etc/sddm.conf` — SDDM configuration (reset to defaults)
+- `/etc/polkit-1/rules.d/void-live.rules` — Live polkit rules
+- Getty auto-login for the live user (only when the config actually contains `-a <live_user>`)
+- `/etc/ssh/ssh_host_*` — SSH host keys
+- `/root/.ssh` and `/home/*/.ssh` — SSH keys from live user home directories
 
-> **Note:** The following files are **NOT** removed because they do not exist on the live ISO or are part of essential packages:
+> **Note:** The following files are **NOT** removed by cleanup:
 > - `/etc/motd` — Does not exist on live ISO
-> - `/etc/issue` — Owned by `base-files`, preserved on target
+> - `/etc/issue` — not removed in cleanup; replaced with custom content during chroot configuration (see `docs/user_config.md`, step 7)
 > - `/mnt/target` — Not created by voidful (created by void-installer only)
-
-#### Additional Live System Cleanup
-
-The official void-installer removes additional files that voidful may also want to clean:
-
-```bash
-# Reset SDDM config to defaults
-rm -f "${TARGET_DIR}/etc/sddm.conf" 2>/dev/null || true
-
-# Remove live polkit rules
-rm -f "${TARGET_DIR}/etc/polkit-1/rules.d/void-live.rules" 2>/dev/null || true
-
-# Remove live user auto-login from getty (if configured)
-# Note: This pattern is ISO-version-dependent. On the current Void Linux
-# live ISO, the getty config does not include auto-login.
-# Use ${LIVE_USERNAME} (not ${USERNAME}) to reference the live ISO user.
-sed -i "s,GETTY_ARGS=\"--noclear -a ${LIVE_USERNAME}\",GETTY_ARGS=\"--noclear\",g" "${TARGET_DIR}/etc/sv/agetty-tty1/conf" 2>/dev/null || true
-
-# Remove SSH host keys
-rm -f "${TARGET_DIR}/etc/ssh/ssh_host_*" 2>/dev/null || true
-```
 
 ### 3.2: Remove Live User Account
 
 Remove the live user account (default: `anon`) from the target system:
 
 ```bash
-if ! chroot "${TARGET_DIR}" userdel -r "${LIVE_USERNAME}" 2>/dev/null; then
-    log_warn "Live user '${LIVE_USERNAME}' not found (may have been removed already)"
+# Check if live user exists in the cloned system, then remove
+if grep -q "^${live_user}:" "${target_dir}/etc/passwd" 2>/dev/null; then
+    chroot "${target_dir}" userdel -r "${live_user}" 2>/dev/null || true
+    log_info "Removed live user '${live_user}'"
+else
+    log_info "Live user '${live_user}' not found, skipping"
 fi
 ```
 
-**Note:** `LIVE_USERNAME` defaults to `anon` on the official Void Linux live ISO (set in `/etc/default/live.conf` as `USERNAME=anon`). The `-r` flag removes the user's home directory and mail spool. Graceful error handling ensures the installer continues even if the user doesn't exist.
+**Note:** `LIVE_USERNAME` defaults to `anon` on the official Void Linux live ISO (set in `/etc/default/live.conf` as `USERNAME=anon`). The function greps `/etc/passwd` first, then runs `userdel -r` with `|| true` and logs the result with `log_info` (not `log_warn`) — the installer continues either way.
 
 ### 3.3: Remove Unnecessary Packages
 
@@ -200,77 +176,78 @@ The following packages MUST NOT be removed during cleanup:
 - `runit` — Required for service management
 - `bash` — Required for shell operations
 
-```bash
-declare -a KEEP_LIST=("dracut" "cryptsetup" "runit" "bash")
-
-# Conditionally add bootloader packages to keep list
-if [ "${BOOTLOADER}" = "grub" ]; then
-    KEEP_LIST+=("grub" "grub-x86_64-efi" "grub-i386-efi")
-fi
-
-declare -a CLEAN_TO_REMOVE=()
-for pkg in ${TO_REMOVE}; do
-    local skip=false
-    for keep in "${KEEP_LIST[@]}"; do
-        [[ "${pkg}" == "${keep}" ]] && skip=true && break
-    done
-    ${skip} || CLEAN_TO_REMOVE+=("${pkg}")
-done
-TO_REMOVE="${CLEAN_TO_REMOVE[*]}"
-```
+Enforcement is via post-removal verification: after `xbps-remove`, `cleanup_packages()` re-queries the target's installed packages and emits `log_warn "Essential package removed: <pkg> — may need reinstall"` if a keep package is missing.
 
 
 
 #### Packages to Remove
 
 ```bash
-# Packages to always remove
-# Note: xmirror depends on dialog. Removing dialog with -R will
-# also remove xmirror as an orphan. Removing xmirror first will
-# leave dialog as an orphan (also removed with -R).
-TO_REMOVE="dialog xtools-minimal xmirror"
+# Packages to always remove (live environment only)
+local -a remove_packages=(dialog xtools-minimal xmirror void-live-audio)
 
-# Conditionally remove based on live environment
-# Note: The following conditional checks are ISO-version-dependent.
-# On some Void Linux live ISO versions, these packages are installed
-# but their services are not running. Consider using xbps-query to
-# check for package installation instead:
-#
-# if xbps-query -s espeakup &>/dev/null; then
-#     TO_REMOVE+=" espeakup"
-# fi
-#
-# For the current ISO version, both packages are installed but
-# /var/service/espeakup and /var/service/brltty do not exist,
-# so these conditionals will not trigger. The packages will be
-# removed unconditionally if listed in TO_REMOVE.
-if [ -e "/var/service/espeakup" ]; then
-    TO_REMOVE+=" espeakup"
+# Conditionally remove espeakup: remove when NOT enabled in the cloned target
+# (not used in the live environment); keep when enabled.
+if [[ ! -e "${TARGET_DIR}/var/service/espeakup" ]]; then
+    remove_packages+=(espeakup)
 fi
 
-if [ -e "/var/service/brltty" ]; then
-    TO_REMOVE+=" brltty"
+# Conditionally remove brltty (same rule as espeakup)
+if [[ ! -e "${TARGET_DIR}/var/service/brltty" ]]; then
+    remove_packages+=(brltty)
 fi
+
+# In the current ISO, both packages are installed but not enabled in the
+# clone, so the conditionals trigger and the packages are removed.
 
 # Remove bootloader packages only if bootloader is disabled
-if [ "${BOOTLOADER}" = "none" ]; then
-    TO_REMOVE+=" grub-x86_64-efi grub-i386-efi grub"
+if [[ "${BOOTLOADER}" == "none" ]]; then
+    remove_packages+=(grub-x86_64-efi grub-i386-efi grub)
 fi
 
-# Apply cleanup exclusions filter (see above)
+# Packages to keep (essential system packages)
+local -a keep_packages=(dracut cryptsetup runit bash)
 
-# Remove packages using xbps-remove in the target
-if [ -n "${TO_REMOVE}" ]; then
-    log_info "Removing unnecessary packages: ${TO_REMOVE}"
-    xbps-remove -r "${TARGET_DIR}" -Ry ${TO_REMOVE}
+# Conditionally add bootloader packages to keep list
+if [[ "${BOOTLOADER}" == "grub" ]]; then
+    keep_packages+=(grub grub-x86_64-efi grub-i386-efi)
 fi
+
+# Build list of packages to remove (only installed ones)
+local -a to_remove=()
+local installed_pkgs
+installed_pkgs=$(chroot "${TARGET_DIR}" xbps-query -l 2>/dev/null | awk "{print \$2}" || true)
+for pkg in "${remove_packages[@]}"; do
+    if echo "${installed_pkgs}" | grep -q "^${pkg}-"; then
+        to_remove+=("${pkg}")
+        log_info "Will remove package: ${pkg}"
+    else
+        log_info "Package not installed: ${pkg}"
+    fi
+done
+
+# Remove all unnecessary packages in a single call
+# This avoids dependency ordering issues (e.g., xmirror depends on dialog)
+if [[ ${#to_remove[@]} -gt 0 ]]; then
+    chroot "${TARGET_DIR}" xbps-remove -y -R "${to_remove[@]}" 2>/dev/null || true
+    log_info "Removed packages: ${to_remove[*]}"
+fi
+
+# Verify essential packages are still present (re-query AFTER removal;
+# xbps-remove -R can remove orphaned dependencies)
+local post_pkgs
+post_pkgs=$(chroot "${TARGET_DIR}" xbps-query -l 2>/dev/null | awk "{print \$2}" || true)
+for pkg in "${keep_packages[@]}"; do
+    if ! echo "${post_pkgs}" | grep -q "^${pkg}-"; then
+        log_warn "Essential package removed: ${pkg} — may need reinstall"
+    fi
+done
 ```
 
 ### xbps-remove Flags
 
 | Flag | Meaning | Notes |
 |------|---------|-------|
-| `-r DIR` | Root directory — operate on the target system's rootfs | Required for clone mode |
 | `-R` | Recursive — remove specified packages AND their orphaned dependencies | Use carefully; may remove packages the user actually wants |
 | `-y` | Assume yes — non-interactive mode | Required for unattended installation |
 
@@ -280,6 +257,7 @@ fi
 - `dialog` — UI tool for the live installer
 - `xtools-minimal` — Live environment tools
 - `xmirror` — Package mirror utility
+- `void-live-audio` — Live-environment audio/speech script (its `alsa-utils` dep becomes orphaned and is removed via `-R`)
 - `espeakup` — Screen reader (only if not running in live)
 - `brltty` — Braille display driver (only if not running in live)
 - `grub-x86_64-efi`, `grub-i386-efi`, `grub` — Bootloader packages (only if bootloader is disabled)
@@ -290,8 +268,9 @@ fi
 
 After all chroot configuration is complete (see `docs/user_config.md` and `docs/luks.md`), the installer performs teardown. The teardown steps are defined in `AGENTS.md` (Pipeline Step 6) and include:
 
-- Remove copied files (resolv.conf, etc.)
-- Unmount `${TARGET_DIR}` recursively (`umount -R`)
+- **Flush the installer log to the target**: `cp "${LOG_FILE}" "${TARGET_DIR}/var/log/voidful.log"`. The stage 4 clone only snapshotted the log at clone start, so without this step the log on the installed system ends at "Starting system clone" and the stage 5-6 lines (cleanup, chroot configuration, e.g. the btrfs default subvolume step) are lost when the live system reboots. Guarded by `findmnt` so the interruption path (target never mounted) does not write to a plain host directory.
+- Swap off the swapfile (`swapoff "${TARGET_DIR}/swapfile"`, the name is hardcoded — there is no `SWAP_FILE` variable) when `SWAP_TYPE="file"` and the swapfile exists — this must happen **before** unmounting, otherwise the swapfile remains active on the mounted filesystem and its backing block device (a LUKS mapper) cannot be closed
+- Unmount nested mount points **deepest-first**: read `/proc/mounts`, keep only the mount points under `${TARGET_DIR}` (i.e. `${TARGET_DIR}/...`), sort them reverse-lexicographically (a nested path is always lexicographically greater than its parent prefix, so children come before parents), then `umount` each; finally unmount `${TARGET_DIR}` itself. (Copy-overwritten files such as `resolv.conf` are **not** removed here — that is done by `_unmount_bind_filesystems()` at the end of the chroot stage.)
 - Close LUKS mapper devices (if any)
 - Sync filesystem buffers
 
@@ -303,11 +282,7 @@ See `AGENTS.md` for the complete teardown procedure.
 
 2. **User Accounts**: The live user account is removed during cleanup. Any additional live user accounts should be removed manually.
 
-3. **SSH Keys**: The live ISO does not ship with SSH keys, but if custom keys were added during live session, remove them:
-   ```bash
-   rm -rf "${TARGET_DIR}/root/.ssh" 2>/dev/null || true
-   rm -rf "${TARGET_DIR}/home/*/.ssh" 2>/dev/null || true
-   ```
+3. **SSH Keys**: `remove_live_files()` already removes `/etc/ssh/ssh_host_*` (host keys) and `/root/.ssh` / `/home/*/.ssh` during post-clone cleanup, so custom keys added during the live session do not carry over to the target.
 
 4. **Network Configuration**: Clear any network configuration from the live environment (e.g., static IP addresses, Wi-Fi passwords). The chroot configuration will overwrite these with user-defined settings.
 

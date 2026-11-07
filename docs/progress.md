@@ -2,87 +2,58 @@
 
 The installer shows real-time progress to the user during installation. Two levels of progress are supported:
 
-1. **Step progress** — Major installation stages (e.g., "Partitioning disk", "Cloning system")
-2. **Sub-step progress** — Detailed feedback within long-running operations (e.g., periodic "still cloning..." messages)
-
-## Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CURRENT_STEP` | Current step number (starts at 0, **reserved** — first `print_step` call shows `[1/N]`) |
-| `STEP_COUNT` | Total number of steps |
-
-## Functions
-
-| Function | Description |
-|----------|-------------|
-| `print_step "message"` | Increments `CURRENT_STEP` and displays progress via `log_info()` |
-
-> **Note:** `CURRENT_STEP=0` is reserved; the first `print_step` call displays `[1/N]`.
-
-
-
-
+1. **Step progress** — Major installation stages, one `log_info` line per stage: `Stage 1: Pre-flight Check` … `Stage 8: End-Action` (there is no `[N/total]` counter and no `print_step()` function; the stage number is hardcoded in each `stage_*()` function in `install.sh`).
+2. **Sub-step progress** — Periodic status messages during long-running operations (e.g., "still cloning..." every 30 seconds) via the `_progress_indicator()` background helper in `lib/clone.sh`.
 
 ## Sub-step Progress for Long Operations
 
-Some operations (clone, package removal, dracut rebuild) take 5-15 minutes. To keep the user informed, use sub-step progress.
+Some operations (clone, package removal, dracut rebuild) take 5-15 minutes. To keep the user informed, a background progress indicator is started before the long operation and cleaned up (`kill` + `wait`) after it completes.
 
-### Pattern: Periodic Status Messages (Recommended)
+### Pattern: Periodic Status Messages
 
-For all long-running operations, use periodic status messages. This pattern is simple, reliable, and avoids race conditions.
+`_progress_indicator <interval>` (in `lib/clone.sh`) loops `sleep <interval>` → `log_info "still cloning..."` in the background. The caller keeps the PID, runs the operation, then kills and waits on the PID.
 
-Display the major step, then start a background progress updater that shows a message every 30 seconds. After the operation completes, clean up the background process with `kill` and `wait`.
-
-#### Implementation Example
+#### Implementation Example (system clone, `lib/clone.sh`)
 
 ```bash
-# Display the major step
-print_step "Cloning system to target disk"
+# Start the background progress indicator (30s interval)
+_progress_indicator 30 &
+PROGRESS_PID=$!
 
-# Start background progress updater
-(
-    while true; do
-        log_info "  [clone progress] Still cloning... please wait"
-        sleep 30
-    done
-) &
-local clone_bg=$!
+# Perform the long-running operation (pipefail suspended around the pipeline
+# so a failing create side is reported via PIPESTATUS instead of aborting)
+set +o pipefail
+if tar --create --one-file-system --xattrs -f - \
+       --exclude=./var/log \
+       --exclude=./etc/machine-id \
+       "${source_root}" 2>"${create_err}" | \
+   tar --extract --xattrs --xattrs-include='*' --preserve-permissions -f - \
+       -C "${target_dir}" 2>"${extract_err}"; then
+    read -r create_status extract_status <<< "${PIPESTATUS[@]}"
+else
+    read -r create_status extract_status <<< "${PIPESTATUS[@]}"
+fi
+set -o pipefail
 
-# Perform the long-running operation
-tar --create \
-    --one-file-system \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory=/ \
-    -f - | \
-tar --extract \
-    --xattrs \
-    --xattrs-include='*' \
-    --directory="${TARGET_DIR}" \
-    --no-overwrite-dir \
-    --preserve-permissions
-
-# Clean up background progress updater
-kill ${clone_bg} 2>/dev/null || true
-wait ${clone_bg} 2>/dev/null || true
-
-log_info "  [clone progress] Clone complete"
+# Clean up the background progress indicator
+kill "${PROGRESS_PID}" 2>/dev/null || true
+wait "${PROGRESS_PID}" 2>/dev/null || true
 ```
 
 **Key points:**
-- Use `log_info` with 2-space indentation for sub-step messages
-- Always `kill` and `wait` the background process after the operation
-- Use `|| true` guards to prevent errors if the process already exited
+- Sub-step messages are `log_info` with no prefix; the stage banner (`Stage 4: System Clone`) is the major step
+- Always `kill` and `wait` the background process after the operation (both on success and on the failure path)
+- Use `|| true` guards so a late-arriving kill/wait cannot trigger `set -e`
 
+## Clone tar flags
 
+- **Create side**: `--create --one-file-system --xattrs -f - --exclude=./var/log --exclude=./etc/machine-id "${source_root}"` — `--one-file-system` stops at filesystem boundaries (skips `/proc`, `/sys`, the live ISO's squashfs, etc.); the two excludes keep volatile per-boot state out of the clone.
+- **Extract side**: `--extract --xattrs --xattrs-include='*' --preserve-permissions -f - -C "${target_dir}"` — there is **no** `--no-overwrite-dir` (destination directories are overwritten so the target rootfs matches the source).
+- `pipefail` is disabled around the pipeline and both statuses are read from `PIPESTATUS`; `create_status == 1` ("file changed as we read it") is treated as a harmless warning, any other failure exits `1`.
 
 ## Best Practices
 
-- Set `STEP_COUNT` to the actual number of major steps before the loop
-- Call `print_step` at the beginning of each major pipeline stage
-- Use descriptive step names that explain what is happening
-- The progress is displayed via `log_info`, which handles color coding and log file writing
-- For operations longer than 30 seconds, show sub-step progress
-- Always clean up background processes (kill/wait) after long operations
-- Use `log_info` for sub-step messages (indented with 2 spaces) to differentiate from major steps
+- Announce each major pipeline stage with `log_info "Stage N: <name>"` at the beginning of the stage
+- For operations longer than 30 seconds, run `_progress_indicator <interval> &` before the operation and `kill`/`wait` the PID after
+- Use `log_info` for sub-step messages to differentiate them from errors/warnings
+- Always clean up background processes (kill/wait) after long operations, on both success and failure paths

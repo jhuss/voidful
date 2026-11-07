@@ -4,7 +4,7 @@ The logging module (`lib/logging.sh`) provides standardized terminal output and 
 
 ## Requirements
 
-The installer must be run as **root** (verified by pre-flight checks). The default log file path (`/var/log/voidful-install.log`) requires root privileges.
+The installer must be run as **root** (verified by pre-flight checks). The default log file path (`/var/log/voidful.log`) requires root privileges.
 
 ## Functions
 
@@ -44,7 +44,11 @@ The `LOG_LEVEL` variable controls the minimum severity level for terminal output
 
 ## Log File
 
-All messages are written to `${LOG_FILE}`. This variable is configurable via environment variable (default: `/var/log/voidful-install.log`). The path requires root privileges.
+All messages are written to `${LOG_FILE}`. This variable is configurable via environment variable (default: `/var/log/voidful.log`). The path requires root privileges.
+
+> **Note:** Log file write errors are suppressed by `_log_write_file`. If the log file is not writable (e.g. running `--help`/`--dry-run`/`--test-mode` as non-root), the write is silently skipped and no `Permission denied` error is printed to the terminal. Terminal output is unaffected.
+
+> **Note:** Logging is strictly append-only — there is no rotation, size cap, or truncation. The stage 4 system clone snapshots `${LOG_FILE}` at clone time, so the copy on the installed system initially ends at "Starting system clone"; `_teardown()` in `install.sh` flushes the complete log to `${TARGET_DIR}/var/log/voidful.log` before unmounting, so the installed system's log contains the full install (stages 1-7) (see `docs/clone_mode.md`, Phase 4: Teardown).
 
 
 

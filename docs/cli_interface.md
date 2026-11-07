@@ -16,9 +16,11 @@ The installer accepts command-line arguments to override configuration values an
 | `--target-disk DISK` | Target disk device (e.g., `/dev/sda`) | `TARGET_DISK` |
 | `--target-dir DIR` | Mount point for root partition | `TARGET_DIR` (default: `/mnt`) |
 | `--end-action ACTION` | Post-install action | `END_ACTION` (default: `shutdown`) |
-| `--bootloader LOADER` | Bootloader to install (`grub` only; `none` supported via config) | `BOOTLOADER` (default: `grub`) |
-| `--dry-run` | Validate config and exit without installing | N/A (requires root for hardware checks) |
-| `--verbose` | Enable verbose logging | `LOG_LEVEL` (default: `info`) |
+| `--bootloader LOADER` | Bootloader to install (`grub` or `none`) | `BOOTLOADER` (default: `grub`) |
+| `--dry-run` | Validate config and exit without installing | N/A (no root required; runs before pre-flight) |
+| `--test-mode` | Generate full operational plan without performing operations | N/A |
+| `--reinstall` | Reinstall over existing installation (unmounts partitions and LUKS mappers first) | N/A |
+| `--verbose` | Enable debug-level logging | `LOG_LEVEL` (set to `debug`; default: `info`) |
 | `--help` | Show help message | N/A |
 | `--version` | Show version | N/A |
 
@@ -26,7 +28,7 @@ The installer accepts command-line arguments to override configuration values an
 
 ## Environment Variables
 
-The following environment variables can also override config values (highest priority):
+The following environment variables are read by the installer when the config file does not set them. Because the config file is `source`d **after** the environment is inspected, a value set in the config file **overrides** the environment variable for these:
 
 | Variable | Description |
 |---|---|
@@ -39,25 +41,24 @@ The following environment variables can also override config values (highest pri
 
 ## Configuration File Discovery
 
-The installer searches for config files in this order:
+The config file is resolved in this order:
 
 1. `--config FILE` (explicit path via CLI)
-2. `$CONFIG_FILE` environment variable
-3. `configs/example-uefi.conf` (default)
-4. `configs/*.conf` — first file found in alphabetical order (fallback if default file doesn't exist)
+2. `configs/example-uefi.conf` (default, when `--config` is not given)
 
-If no config file is found, the installer exits with an error.
+If the resolved file does not exist, the installer exits with an error. There is no `$CONFIG_FILE` environment variable and no directory-scan fallback.
 
-> **Note:** In dry-run mode, the installer still requires root privileges (for hardware detection and config file discovery). No disk operations are performed.
+> **Note:** In dry-run mode the installer does **not** require root and performs no hardware detection — it only sources the config file and runs `validate_config()`.
 
 ## Override Priority
 
 Configuration values are resolved in this order (highest priority first):
 
-1. **Environment variables** — `LUKS_PASSPHRASE`, `ROOT_PASS`, etc.
-2. **CLI arguments** — `--config`, `--target-disk`, etc.
-3. **Config file** — values defined in `configs/*.conf`
-4. **Defaults** — hardcoded defaults in the installer
+1. **CLI arguments** — `--config`, `--target-disk`, etc.
+2. **Config file** — values defined in `configs/*.conf`
+3. **Defaults** — hardcoded defaults in the installer
+
+> **Note:** Environment variables (`LUKS_PASSPHRASE`, `ROOT_PASS`, `USER_PASS`, `END_ACTION_SCRIPT`, `END_ACTION_FUNC`, `LUKS_KEYFILE`) are read only when the config file does not set them — the sourced config file wins, and CLI arguments win over both (they are applied after the config file is sourced).
 
 ## Example Usage
 
@@ -77,6 +78,16 @@ sudo ./install.sh --config configs/example-encrypted.conf --target-disk /dev/nvm
 sudo ./install.sh --config configs/example-uefi.conf --dry-run
 ```
 
+### Reinstall mode (over existing installation):
+```bash
+sudo ./install.sh --config configs/example-uefi.conf --target-disk /dev/sda --reinstall
+```
+
+The `--reinstall` option:
+1. Detects and unmounts any existing partitions on the target disk
+2. Closes any existing LUKS mapper devices for the target disk
+3. Proceeds with the normal installation pipeline (wipefs, sfdisk, format, clone, chroot)
+
 ### Verbose installation:
 ```bash
 sudo ./install.sh --verbose --config configs/example-minimal.conf --target-disk /dev/sda --end-action reboot
@@ -84,18 +95,38 @@ sudo ./install.sh --verbose --config configs/example-minimal.conf --target-disk 
 
 ## Dry-Run Mode
 
-When `--dry-run` is specified, the installer validates the configuration and exits without performing any installation steps:
+When `--dry-run` is specified, the installer validates the configuration and exits before the pre-flight stage, without performing any installation steps:
 
 1. Loads the config file
 2. Runs `validate_config()`
-3. Displays the resolved configuration
+3. Prints "Configuration is valid"
 4. Exits with code `0` on success, `1` on failure
 
 **Requirements:**
-- Root privileges required (for hardware detection and config file discovery)
+- No root privileges required (dry-run runs before `stage_preflight`, so no hardware detection is performed)
 - No disk operations are performed
 
-**Exit codes:** `0` (success), `1` (validation failure), `2` (disk error — target disk not found), `3` (permission error — not root). See `docs/exit_codes.md` for the full reference.
+**Exit codes:** `0` (success), `1` (validation failure / missing config). See `docs/exit_codes.md` for the full reference.
+
+## Reinstall Mode
+
+When `--reinstall` is specified, the installer performs pre-installation cleanup on the target disk before partitioning. This is useful for re-installing over an existing Void Linux installation without destroying the entire disk first.
+
+### What it does:
+
+1. **Unmounts existing partitions** — Scans for any partitions on the target disk that are currently mounted and unmounts them
+2. **Closes LUKS mappers** — Detects and closes any open LUKS mapper devices (`/dev/mapper/luks-*`) that point to the target disk
+3. **Continues normal pipeline** — After cleanup, proceeds with `wipefs`, `sfdisk`, formatting, cloning, and chroot configuration
+
+### Safety:
+
+- The unmount operation uses `umount -f` (force) to handle busy filesystems
+- If a partition cannot be unmounted, a warning is logged but the installer continues
+- LUKS mapper closure is best-effort — if `cryptsetup close` fails, a warning is logged
+- The `wipefs -a` and `sfdisk` steps will still overwrite all data regardless
+
+### Exit codes:
+Same as normal installation (pre-flight `2`/`3`, any module failure `1`, signal `8`, end-action `9`). See `docs/exit_codes.md` for the full reference.
 
 ## Pre-flight: Root Check
 

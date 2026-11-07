@@ -1,36 +1,34 @@
 # Exit Codes
 
-Standardized exit codes for the installer:
+Standardized exit codes produced by the installer:
 
 | Code | Meaning |
 |------|---------|
 | `0` | Success — installation completed |
-| `1` | General error — validation failure, missing config |
-| `2` | Disk error — target disk not found, not a block device |
+| `1` | General error — config validation failure, missing config file, or failure of any pipeline stage (partitioning, LUKS, clone, cleanup, chroot configuration, bootloader, mounting) |
+| `2` | Disk error — target disk not found, not a block device, or the CD-ROM drive (`sr0`) |
 | `3` | Permission error — not running as root |
-| `4` | Clone error — tar operation failed |
-| `5` | Chroot error — configuration inside chroot failed |
-| `6` | Bootloader error — GRUB installation failed (only applies when `BOOTLOADER != "none"`) |
-| `7` | LUKS error — cryptsetup operation failed |
-| `8` | User interruption — installer was cancelled (SIGINT/SIGTERM) |
-| `9` | End-action error — post-install action failed (see `docs/end_actions.md`) |
-| `10` | Mount/umount error — failed to mount or unmount filesystems |
+| `8` | User interruption — installer was cancelled (SIGINT/SIGTERM/SIGHUP) or a pipeline stage was interrupted by a broken pipe |
+| `9` | Unknown `END_ACTION` value (see `docs/end_actions.md`) |
+
+> **Why module failures all exit `1`:** every function in `lib/*.sh` signals failure
+> with `return 1`, the stages in `install.sh` invoke them plainly under
+> `set -euo pipefail`, and the `EXIT` trap (`trap_cleanup`) preserves that code
+> while running cleanup. The code above is therefore the code of the failing
+> module, uniformly `1`. A non-zero exit of a `script` or `func` end-action
+> propagates the child's own exit code (not `9`).
 
 ## Responsibility Mapping
 
-Each exit code maps to a specific module and function responsible for the error:
-
-| Code | Module | Function |
+| Code | Module | Function / location |
 |------|--------|----------|
-| `1` | `install.sh` | `validate_config()` |
-| `2` | `lib/hardware.sh`, `lib/partitioning.sh` | `get_disks()`, `validate_disk()` |
-| `3` | `install.sh` | `check_root()` |
-| `4` | `lib/clone.sh` | `clone_system()` |
-| `5` | `lib/chroot_tasks.sh` | Any chroot operation |
-| `6` | `lib/chroot_tasks.sh` | `configure_bootloader()` |
-| `7` | `lib/partitioning.sh`, `lib/luks.sh` | `format_luks()`, `open_luks()` |
-| `8` | `install.sh` | `handle_signal()` |
-| `9` | `install.sh` | `end_actions()` |
-| `10` | `lib/partitioning.sh`, `lib/clone.sh` | `mount_filesystems()`, `unmount_filesystems()` |
+| `1` | `lib/config.sh` | `validate_config()` (also `run_dry_run()`) |
+| `1` | `lib/*.sh` (all) | Any stage failure: `wipe_and_partition()`, `format_luks_partitions()`, `open_luks_partitions()`, `mount_filesystems()`, `clone_system()`, `cleanup_packages()`, `configure_chroot()` (incl. `_install_grub()`), `stage_teardown()` |
+| `2` | `lib/hardware.sh` | `validate_disk()` (checked in `stage_preflight()`) |
+| `3` | `install.sh` | root check in `stage_preflight()` |
+| `8` | `install.sh` | signal trap: `trap 'trap_cleanup; exit 8' INT TERM HUP PIPE` |
+| `9` | `install.sh` | `stage_end_action()` — unknown `END_ACTION` value |
 
-Signal handlers use exit code `8` for user interruptions. The EXIT trap in `docs/signal_handling.md` preserves the exit code set by the failing module, allowing the cleanup routine to report the correct error code.
+The EXIT trap (`trap trap_cleanup EXIT`) preserves the exit code set by the
+failing command, so the cleanup routine (unmount + LUKS close + sync, see
+`docs/signal_handling.md`) never masks the real error code.
